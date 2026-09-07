@@ -13,12 +13,18 @@ function loadEnv() {
 }
 loadEnv();
 
+const host = process.env.DB_HOST || '127.0.0.1';
+const isLocal = host === '127.0.0.1' || host === 'localhost';
+// Managed MySQL (DigitalOcean etc.) requires TLS; mirror src/lib/db.ts.
+const useSsl = process.env.DB_SSL ? process.env.DB_SSL !== 'false' : !isLocal;
+
 export const dbConfig = {
-  host: process.env.DB_HOST || '127.0.0.1',
+  host,
   port: Number(process.env.DB_PORT || 3307),
   user: process.env.DB_USER || 'root',
   password: process.env.DB_PASSWORD || '',
   database: process.env.DB_NAME || 'leads_db',
+  ssl: useSsl ? { rejectUnauthorized: false } : undefined,
 };
 
 export const connect = () => mysql.createConnection({ ...dbConfig, multipleStatements: false });
