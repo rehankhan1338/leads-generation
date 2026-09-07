@@ -1,4 +1,4 @@
-import { query } from './db';
+import { query, withTimeout } from './db';
 
 export type Lead = {
   id: number;
@@ -175,8 +175,7 @@ export async function searchLeads(f: LeadFilters) {
   // Hard ceiling so a pathological sort/filter combination fails fast instead
   // of pinning a MySQL thread for minutes while the user waits.
   const rows = await query<Lead>(
-    `SET STATEMENT max_statement_time=${ROWS_TIMEOUT_SECONDS} FOR
-     SELECT id, source, company_name, domain, website_url, linkedin_url, twitter_url,
+    await withTimeout(ROWS_TIMEOUT_SECONDS, `SELECT id, source, company_name, domain, website_url, linkedin_url, twitter_url,
             facebook_url, crunchbase_url, logo_url, source_url, industry, category,
             country, country_code, state, city, employees, monthly_visits,
             monthly_sales_usd, tech_count, platform_rank, founded_year,
@@ -185,7 +184,7 @@ export async function searchLeads(f: LeadFilters) {
             contact_linkedin_url, revenue_alt_usd, imported_at
      FROM leads ${fullWhere}
      ORDER BY ${orderBy}
-     LIMIT ? OFFSET ?`,
+     LIMIT ? OFFSET ?`),
     [...params, perPage, offset],
   );
 
@@ -197,8 +196,8 @@ export async function searchLeads(f: LeadFilters) {
   let capped = false;
   try {
     const [{ n }] = await query<{ n: number }>(
-      `SET STATEMENT max_statement_time=${COUNT_TIMEOUT_SECONDS} FOR
-       SELECT COUNT(*) AS n FROM (SELECT 1 FROM leads ${fullWhere} LIMIT ${COUNT_CAP}) t`,
+      await withTimeout(COUNT_TIMEOUT_SECONDS,
+        `SELECT COUNT(*) AS n FROM (SELECT 1 FROM leads ${fullWhere} LIMIT ${COUNT_CAP}) t`),
       params,
     );
     total = Number(n);

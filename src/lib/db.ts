@@ -32,3 +32,24 @@ export async function query<T = Record<string, unknown>>(sql: string, params: un
   const [rows] = await pool.query(sql, params);
   return rows as T[];
 }
+
+let flavorPromise: Promise<'mariadb' | 'mysql'> | undefined;
+async function flavor() {
+  flavorPromise ??= pool
+    .query<mysql.RowDataPacket[]>('SELECT VERSION() AS v')
+    .then(([[r]]) => (/mariadb/i.test(String(r.v)) ? 'mariadb' : 'mysql'))
+    .catch(() => { flavorPromise = undefined; return 'mysql' as const; });
+  return flavorPromise;
+}
+
+/**
+ * Wrap a SELECT so the server aborts it after `seconds`. MariaDB (local XAMPP)
+ * uses SET STATEMENT; MySQL 8 (DigitalOcean) uses the MAX_EXECUTION_TIME hint
+ * and rejects the MariaDB form with a parse error.
+ */
+export async function withTimeout(seconds: number, selectSql: string) {
+  if ((await flavor()) === 'mariadb') {
+    return `SET STATEMENT max_statement_time=${seconds} FOR ${selectSql}`;
+  }
+  return selectSql.replace(/^\s*SELECT\b/i, `SELECT /*+ MAX_EXECUTION_TIME(${seconds * 1000}) */`);
+}
