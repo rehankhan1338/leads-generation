@@ -235,7 +235,23 @@ async function estimateMatches(f: LeadFilters) {
   return est === Infinity ? null : est;
 }
 
-function indexHint(f: LeadFilters, sortCol: string, estimate: number | null) {
+/**
+ * Index names present on the connected database. Not every environment has run
+ * every migration, and FORCE INDEX with an unknown name is a hard error
+ * (MySQL 1176), so hints are limited to what actually exists.
+ */
+let knownIndexes: Promise<Set<string>> | undefined;
+function existingIndexes() {
+  knownIndexes ??= query<{ index_name: string }>(
+    `SELECT DISTINCT INDEX_NAME AS index_name FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'leads'`,
+  )
+    .then((rows) => new Set(rows.map((r) => r.index_name)))
+    .catch(() => { knownIndexes = undefined; return new Set<string>(); });
+  return knownIndexes;
+}
+
+async function indexHint(f: LeadFilters, sortCol: string, estimate: number | null) {
   const hints = new Set<string>();
   for (const [key, idx] of Object.entries(FILTER_INDEXES)) {
     if ((f[key as keyof LeadFilters] as string[] | undefined)?.length) idx.forEach((i) => hints.add(i));
@@ -247,7 +263,9 @@ function indexHint(f: LeadFilters, sortCol: string, estimate: number | null) {
   if (hints.size === 0) return '';
   const sortIdx = SORT_INDEXES[sortCol];
   if (sortIdx && (estimate == null || estimate > SMALL_RESULT_SET)) hints.add(sortIdx);
-  return `FORCE INDEX (${[...hints].join(', ')})`;
+  const known = await existingIndexes();
+  const usable = [...hints].filter((i) => known.has(i));
+  return usable.length ? `FORCE INDEX (${usable.join(', ')})` : '';
 }
 
 function pageBounds(f: LeadFilters) {
@@ -288,14 +306,24 @@ export async function searchLeads(f: LeadFilters) {
   // Two steps: find the page of ids using only the index, then fetch the wide
   // rows by primary key. Sorting/skipping over 36 wide columns (20 GB table)
   // was 10-100x slower than doing the same over index entries.
-  const hint = indexHint(f, sortCol, await estimateMatches(f));
-  const ids = (
-    await query<{ id: number }>(
+  const hint = await indexHint(f, sortCol, await estimateMatches(f));
+  const idsFor = async (forceIndex: string) =>
+    query<{ id: number }>(
       await withTimeout(ROWS_TIMEOUT_SECONDS,
-        `SELECT id FROM leads ${hint} ${fullWhere} ${orderBy} LIMIT ? OFFSET ?`),
+        `SELECT id FROM leads ${forceIndex} ${fullWhere} ${orderBy} LIMIT ? OFFSET ?`),
       [...params, perPage, offset],
-    )
-  ).map((r) => r.id);
+    );
+  let idRows: { id: number }[];
+  try {
+    idRows = await idsFor(hint);
+  } catch (e) {
+    // The server rejected the hint (an index we thought existed does not, or
+    // its name is unusable here). Correct-but-slower beats an error page.
+    if (!hint || (e as { errno?: number }).errno !== 1176) throw e;
+    knownIndexes = undefined;
+    idRows = await idsFor('');
+  }
+  const ids = idRows.map((r) => r.id);
 
   let rows: Lead[] = [];
   if (ids.length) {
