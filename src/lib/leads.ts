@@ -152,13 +152,118 @@ function buildWhere(f: LeadFilters) {
   return { sql: where.length ? `WHERE ${where.join(' AND ')}` : '', params };
 }
 
-export async function searchLeads(f: LeadFilters) {
-  const { sql: whereSql, params } = buildWhere(f);
+const LEAD_COLUMNS = `id, source, company_name, domain, website_url, linkedin_url, twitter_url,
+            facebook_url, crunchbase_url, logo_url, source_url, industry, category,
+            country, country_code, state, city, employees, monthly_visits,
+            monthly_sales_usd, tech_count, platform_rank, founded_year,
+            revenue_usd, revenue_text, funding_usd, funding_text, growth_percent,
+            contact_name, contact_title, contact_email, email_status, contact_phone,
+            contact_linkedin_url, revenue_alt_usd, imported_at`;
 
+/**
+ * Indexes that can serve each filter. Given any `ORDER BY id ... LIMIT n` the
+ * MariaDB optimizer assumes it will find n matches almost immediately and walks
+ * the PRIMARY key backwards testing every row — with a rare filter (Latka is
+ * 47k of 16M rows, mostly the oldest ids) that means reading the whole 20 GB
+ * table, which took minutes and pinned a pool connection. Handing it an
+ * explicit list of candidate indexes takes that option off the table while
+ * still letting it pick the best of the rest.
+ */
+const FILTER_INDEXES: Record<string, string[]> = {
+  source: ['idx_source', 'idx_source_employees', 'idx_source_country_employees', 'idx_country', 'idx_industry', 'idx_category'],
+  country: ['idx_country_only', 'idx_country_employees'],
+  industry: ['idx_industry_only'],
+  category: ['idx_category_only'],
+  emailStatus: ['idx_email_status'],
+};
+
+const SORT_INDEXES: Record<string, string> = {
+  revenue_usd: 'idx_revenue',
+  funding_usd: 'idx_funding',
+  growth_percent: 'idx_growth',
+  employees: 'idx_employees',
+  monthly_visits: 'idx_monthly_visits',
+  tech_count: 'idx_tech_count',
+  company_name: 'idx_company',
+  source: 'idx_source',
+  country: 'idx_country_only',
+  industry: 'idx_industry_only',
+};
+
+const RANGE_INDEXES: [keyof LeadFilters, keyof LeadFilters | null, string][] = [
+  ['revenueMin', 'revenueMax', 'idx_revenue'],
+  ['fundingMin', 'fundingMax', 'idx_funding'],
+  ['employeesMin', 'employeesMax', 'idx_employees'],
+  ['visitsMin', 'visitsMax', 'idx_monthly_visits'],
+  ['techMin', null, 'idx_tech_count'],
+  ['growthMin', null, 'idx_growth'],
+];
+
+/**
+ * Below this many candidate rows it is cheaper to read them all through the
+ * filter index and sort, than to walk the sort index testing each row for the
+ * filter. Latka (47k rows) sorted by company took 6.6 s via idx_company but
+ * 0.2 s via idx_source; for StoreLeads (4.5M rows) it is the reverse.
+ */
+const SMALL_RESULT_SET = 100_000;
+
+/** Facet counts, refreshed from lead_facets every few minutes, used to size the query plan. */
+const FACET_CACHE_MS = 5 * 60_000;
+let facetCountsCache: { at: number; counts: Record<string, Map<string, number>> } | undefined;
+async function facetCounts() {
+  if (facetCountsCache && Date.now() - facetCountsCache.at < FACET_CACHE_MS) return facetCountsCache.counts;
+  const facets = await getFacets();
+  const counts: Record<string, Map<string, number>> = {};
+  for (const [facet, values] of Object.entries(facets)) {
+    counts[facet] = new Map(values.map((v) => [v.value, v.lead_count]));
+  }
+  facetCountsCache = { at: Date.now(), counts };
+  return counts;
+}
+
+/** Upper bound on matching rows from the facet filters alone, or null if none apply. */
+async function estimateMatches(f: LeadFilters) {
+  const active = (['source', 'industry', 'country', 'category'] as const).filter((k) => f[k]?.length);
+  if (!active.length) return null;
+  const counts = await facetCounts();
+  let est = Infinity;
+  for (const facet of active) {
+    const m = counts[facet];
+    if (!m) continue;
+    est = Math.min(est, f[facet]!.reduce((sum, v) => sum + (m.get(v) ?? 0), 0));
+  }
+  return est === Infinity ? null : est;
+}
+
+function indexHint(f: LeadFilters, sortCol: string, estimate: number | null) {
+  const hints = new Set<string>();
+  for (const [key, idx] of Object.entries(FILTER_INDEXES)) {
+    if ((f[key as keyof LeadFilters] as string[] | undefined)?.length) idx.forEach((i) => hints.add(i));
+  }
+  for (const [min, max, idx] of RANGE_INDEXES) {
+    if (f[min] != null || (max && f[max] != null)) hints.add(idx);
+  }
+  // Nothing selective to seek on: scanning in sort order is the right plan.
+  if (hints.size === 0) return '';
+  const sortIdx = SORT_INDEXES[sortCol];
+  if (sortIdx && (estimate == null || estimate > SMALL_RESULT_SET)) hints.add(sortIdx);
+  return `FORCE INDEX (${[...hints].join(', ')})`;
+}
+
+function pageBounds(f: LeadFilters) {
   const perPage = Math.min(Math.max(f.perPage ?? 50, 10), 200);
   const page = Math.max(f.page ?? 1, 1);
-  const offset = (page - 1) * perPage;
+  return { perPage, page, offset: (page - 1) * perPage };
+}
 
+/** WHERE clause including the NULL guard the sort needs, so rows and count agree. */
+function buildQueryShape(f: LeadFilters) {
+  const { sql: whereSql, params } = buildWhere(f);
+
+  // A text search with no explicit sort comes back in relevance order. Forcing
+  // `ORDER BY id` on a fulltext match makes InnoDB materialise every hit first
+  // (a common prefix like "shop*" matches millions) and ran for minutes.
+  const relevance = Boolean(f.q?.trim()) && !f.sort;
   const sortCol = SORTABLE[f.sort ?? ''] ?? 'id';
   const dir = f.dir === 'asc' ? 'ASC' : 'DESC';
   // Keep ORDER BY a plain indexed column: an expression like
@@ -166,49 +271,68 @@ export async function searchLeads(f: LeadFilters) {
   // which at millions of rows per source ran for minutes. MariaDB already
   // sorts NULLs first, so DESC naturally puts empty values last; for ASC we
   // exclude them instead so the index is still usable.
-  const orderBy = sortCol === 'id' ? `id ${dir}` : `${sortCol} ${dir}, id ${dir}`;
-  const nullGuard = sortCol !== 'id' && dir === 'ASC' ? `${sortCol} IS NOT NULL` : null;
+  const orderBy = relevance ? '' : `ORDER BY ${sortCol === 'id' ? `id ${dir}` : `${sortCol} ${dir}, id ${dir}`}`;
+  const nullGuard = !relevance && sortCol !== 'id' && dir === 'ASC' ? `${sortCol} IS NOT NULL` : null;
   const fullWhere = nullGuard
     ? (whereSql ? `${whereSql} AND ${nullGuard}` : `WHERE ${nullGuard}`)
     : whereSql;
 
-  // Hard ceiling so a pathological sort/filter combination fails fast instead
-  // of pinning a MySQL thread for minutes while the user waits.
-  const rows = await query<Lead>(
-    await withTimeout(ROWS_TIMEOUT_SECONDS, `SELECT id, source, company_name, domain, website_url, linkedin_url, twitter_url,
-            facebook_url, crunchbase_url, logo_url, source_url, industry, category,
-            country, country_code, state, city, employees, monthly_visits,
-            monthly_sales_usd, tech_count, platform_rank, founded_year,
-            revenue_usd, revenue_text, funding_usd, funding_text, growth_percent,
-            contact_name, contact_title, contact_email, email_status, contact_phone,
-            contact_linkedin_url, revenue_alt_usd, imported_at
-     FROM leads ${fullWhere}
-     ORDER BY ${orderBy}
-     LIMIT ? OFFSET ?`),
-    [...params, perPage, offset],
-  );
+  return { fullWhere, params, orderBy, sortCol };
+}
 
-  // Some filter combinations have no index that helps (e.g. country + "has
-  // email"), and counting them can run for minutes. Cap the rows examined and
-  // put a hard time limit on top; if either trips we report an approximate
-  // total rather than making the page wait.
-  let total = 0;
-  let capped = false;
+/** One page of leads. The total is deliberately separate — see `countLeads`. */
+export async function searchLeads(f: LeadFilters) {
+  const { fullWhere, params, orderBy, sortCol } = buildQueryShape(f);
+  const { perPage, page, offset } = pageBounds(f);
+
+  // Two steps: find the page of ids using only the index, then fetch the wide
+  // rows by primary key. Sorting/skipping over 36 wide columns (20 GB table)
+  // was 10-100x slower than doing the same over index entries.
+  const hint = indexHint(f, sortCol, await estimateMatches(f));
+  const ids = (
+    await query<{ id: number }>(
+      await withTimeout(ROWS_TIMEOUT_SECONDS,
+        `SELECT id FROM leads ${hint} ${fullWhere} ${orderBy} LIMIT ? OFFSET ?`),
+      [...params, perPage, offset],
+    )
+  ).map((r) => r.id);
+
+  let rows: Lead[] = [];
+  if (ids.length) {
+    const fetched = await query<Lead>(
+      `SELECT ${LEAD_COLUMNS} FROM leads WHERE id IN (${ids.map(() => '?').join(',')})`,
+      ids,
+    );
+    const byId = new Map(fetched.map((r) => [r.id, r]));
+    rows = ids.map((id) => byId.get(id)).filter((r): r is Lead => r != null);
+  }
+
+  return { rows, page, perPage };
+}
+
+/**
+ * Total matches for the pagination footer. Some filter combinations have no
+ * index that helps (e.g. source + "has email", or a common search prefix) and
+ * counting them can run for minutes. Cap the rows examined and put a hard time
+ * limit on top; if either trips we report an approximate total instead. This
+ * is kept apart from `searchLeads` so the page can stream the rows immediately
+ * and fill the total in when it arrives.
+ */
+export async function countLeads(f: LeadFilters, rowsOnPage: number) {
+  const { fullWhere, params } = buildQueryShape(f);
+  const { perPage, offset } = pageBounds(f);
   try {
     const [{ n }] = await query<{ n: number }>(
       await withTimeout(COUNT_TIMEOUT_SECONDS,
         `SELECT COUNT(*) AS n FROM (SELECT 1 FROM leads ${fullWhere} LIMIT ${COUNT_CAP}) t`),
       params,
     );
-    total = Number(n);
-    capped = total >= COUNT_CAP;
+    const total = Number(n);
+    return { total, capped: total >= COUNT_CAP };
   } catch {
-    // Timed out: we know there is at least a full page, so keep paging usable.
-    total = offset + rows.length + (rows.length === perPage ? perPage : 0);
-    capped = true;
+    // Timed out: we know there is at least this page, so keep paging usable.
+    return { total: offset + rowsOnPage + (rowsOnPage === perPage ? perPage : 0), capped: true };
   }
-
-  return { rows, total, capped, page, perPage };
 }
 
 export type FacetValue = { value: string; lead_count: number };

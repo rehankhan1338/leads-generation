@@ -1,7 +1,7 @@
 import { Suspense } from 'react';
 import Link from 'next/link';
 import { Activity, Database } from 'lucide-react';
-import { getFacets, getStats, searchLeads } from '@/lib/leads';
+import { countLeads, getFacets, getStats, searchLeads, type LeadFilters as Filters } from '@/lib/leads';
 import { parseFilters, type RawParams } from '@/lib/search-params';
 import { LeadFilters } from '@/components/leads/filters';
 import { LeadsTable } from '@/components/leads/leads-table';
@@ -61,13 +61,35 @@ export default async function LeadsPage({
 
 async function Results({ sp }: { sp: RawParams }) {
   const filters = parseFilters(sp);
-  const { rows, total, capped, page, perPage } = await searchLeads(filters);
+  const { rows, page, perPage } = await searchLeads(filters);
 
+  // The count can take up to COUNT_TIMEOUT_SECONDS on unindexed combinations;
+  // stream it behind the rows instead of holding the whole table back.
   return (
     <>
       <LeadsTable rows={rows} />
-      <Pagination page={page} perPage={perPage} total={total} capped={capped} />
+      <Suspense fallback={<PaginationSkeleton />}>
+        <Footer filters={filters} rowsOnPage={rows.length} page={page} perPage={perPage} />
+      </Suspense>
     </>
+  );
+}
+
+async function Footer({
+  filters, rowsOnPage, page, perPage,
+}: {
+  filters: Filters; rowsOnPage: number; page: number; perPage: number;
+}) {
+  const { total, capped } = await countLeads(filters, rowsOnPage);
+  return <Pagination page={page} perPage={perPage} total={total} capped={capped} />;
+}
+
+function PaginationSkeleton() {
+  return (
+    <div className="flex items-center justify-between border-t px-4 py-3">
+      <Skeleton className="h-5 w-40" />
+      <Skeleton className="h-8 w-48" />
+    </div>
   );
 }
 
