@@ -2,7 +2,7 @@
 
 import * as React from 'react';
 import { useRouter, useSearchParams, usePathname } from 'next/navigation';
-import { Search, X, SlidersHorizontal } from 'lucide-react';
+import { Search, X, SlidersHorizontal, LoaderCircle } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
@@ -45,8 +45,14 @@ const MONEY_STEPS = [
 export function LeadFilters({ facets }: { facets: FacetMap }) {
   const router = useRouter();
   const pathname = usePathname();
-  const params = useSearchParams();
+  const urlParams = useSearchParams();
   const [pending, startTransition] = React.useTransition();
+  // The URL only changes once the server has answered, so a checkbox that
+  // reads straight from `useSearchParams` looks stuck until then. Render the
+  // requested state immediately; React reverts to the real URL if the
+  // navigation fails.
+  const [optimisticQs, setOptimisticQs] = React.useOptimistic(urlParams.toString());
+  const params = React.useMemo(() => new URLSearchParams(optimisticQs), [optimisticQs]);
 
   /** Every control funnels through here: patch the URL, let the server re-query. */
   const update = React.useCallback(
@@ -59,9 +65,13 @@ export function LeadFilters({ facets }: { facets: FacetMap }) {
         else next.set(key, value);
       }
       if (!('page' in patch)) next.delete('page'); // any filter change resets paging
-      startTransition(() => router.push(`${pathname}?${next.toString()}`, { scroll: false }));
+      const qs = next.toString();
+      startTransition(() => {
+        setOptimisticQs(qs);
+        router.push(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+      });
     },
-    [params, pathname, router],
+    [params, pathname, router, setOptimisticQs],
   );
 
   const list = (key: string) => params.get(key)?.split(',').filter(Boolean) ?? [];
@@ -96,13 +106,19 @@ export function LeadFilters({ facets }: { facets: FacetMap }) {
           <SlidersHorizontal className="size-4" />
           Filters
           {activeCount > 0 && <Badge variant="secondary">{activeCount}</Badge>}
+          {pending && <LoaderCircle className="size-3.5 animate-spin text-muted-foreground" aria-label="Loading results" />}
         </h2>
         {activeCount > 0 && (
           <Button
             variant="ghost"
             size="sm"
             className="h-7 px-2 text-xs"
-            onClick={() => startTransition(() => router.push(pathname, { scroll: false }))}
+            onClick={() =>
+              startTransition(() => {
+                setOptimisticQs('');
+                router.push(pathname, { scroll: false });
+              })
+            }
           >
             <X className="size-3" /> Clear
           </Button>
