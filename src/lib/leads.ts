@@ -94,8 +94,12 @@ const HAS_COLUMN: Record<string, string> = {
 
 /** Counting every match on a 100M-row table is too slow; stop at this many. */
 export const COUNT_CAP = 100_000;
-/** Hard ceiling on how long a count may run before we fall back to an estimate. */
-export const COUNT_TIMEOUT_SECONDS = 2;
+/**
+ * Hard ceiling on how long a count may run before we fall back to an estimate.
+ * The response stream stays open until the count settles, so this is also how
+ * long the browser keeps "loading" after the rows are already on screen.
+ */
+export const COUNT_TIMEOUT_SECONDS = 1;
 /** Hard ceiling on the page query itself; beyond this the request errors rather than hangs. */
 export const ROWS_TIMEOUT_SECONDS = 30;
 
@@ -207,28 +211,16 @@ const RANGE_INDEXES: [keyof LeadFilters, keyof LeadFilters | null, string][] = [
  */
 const SMALL_RESULT_SET = 100_000;
 
-/** Facet counts, refreshed from lead_facets every few minutes, used to size the query plan. */
-const FACET_CACHE_MS = 5 * 60_000;
-let facetCountsCache: { at: number; counts: Record<string, Map<string, number>> } | undefined;
-async function facetCounts() {
-  if (facetCountsCache && Date.now() - facetCountsCache.at < FACET_CACHE_MS) return facetCountsCache.counts;
-  const facets = await getFacets();
-  const counts: Record<string, Map<string, number>> = {};
-  for (const [facet, values] of Object.entries(facets)) {
-    counts[facet] = new Map(values.map((v) => [v.value, v.lead_count]));
-  }
-  facetCountsCache = { at: Date.now(), counts };
-  return counts;
-}
+const FACET_KEYS = ['source', 'industry', 'country', 'category'] as const;
 
 /** Upper bound on matching rows from the facet filters alone, or null if none apply. */
 async function estimateMatches(f: LeadFilters) {
-  const active = (['source', 'industry', 'country', 'category'] as const).filter((k) => f[k]?.length);
+  const active = FACET_KEYS.filter((k) => f[k]?.length);
   if (!active.length) return null;
-  const counts = await facetCounts();
+  const { totals } = await facetIndex();
   let est = Infinity;
   for (const facet of active) {
-    const m = counts[facet];
+    const m = totals.get(facet);
     if (!m) continue;
     est = Math.min(est, f[facet]!.reduce((sum, v) => sum + (m.get(v) ?? 0), 0));
   }
@@ -374,6 +366,10 @@ export async function searchLeads(f: LeadFilters) {
  * and fill the total in when it arrives.
  */
 export async function countLeads(f: LeadFilters, rowsOnPage: number | Promise<number>) {
+  // Facet-only filters have a pre-computed exact total; skip the database.
+  const exact = await exactTotalFromFacets(f);
+  if (exact != null) return { total: exact, capped: false };
+
   const { fullWhere, params } = buildQueryShape(f);
   const { perPage, offset } = pageBounds(f);
   try {
@@ -391,30 +387,95 @@ export async function countLeads(f: LeadFilters, rowsOnPage: number | Promise<nu
   }
 }
 
+/**
+ * Exact match count from `lead_facets` when the filters are nothing but facet
+ * values, which is most page views. The table stores every (facet, value)
+ * count per source, so any single facet, and `source` combined with one other
+ * facet, is a lookup; anything else (text search, ranges, "has" toggles, two
+ * non-source facets) needs the real count. An ascending sort adds an
+ * `IS NOT NULL` guard that the facets cannot see, so that also falls through.
+ * Facets are rebuilt by `npm run db:facets`, so between an import and the next
+ * rebuild this total lags exactly like the header counts do.
+ */
+async function exactTotalFromFacets(f: LeadFilters): Promise<number | null> {
+  if (f.q?.trim() || f.emailStatus?.length || f.has?.length) return null;
+  for (const [min, max] of RANGE_INDEXES) {
+    if (f[min] != null || (max && f[max] != null)) return null;
+  }
+  const sortCol = SORTABLE[f.sort ?? ''] ?? 'id';
+  if (sortCol !== 'id' && f.dir === 'asc') return null;
+
+  const active = FACET_KEYS.filter((k) => f[k]?.length);
+  const { totals, perSource } = await facetIndex();
+  const sumOf = (m: Map<string, number> | undefined, values: string[]) =>
+    values.reduce((sum, v) => sum + (m?.get(v) ?? 0), 0);
+
+  if (active.length === 0) {
+    let all = 0;
+    for (const n of totals.get('source')?.values() ?? []) all += n;
+    return all;
+  }
+  if (active.length === 1) return sumOf(totals.get(active[0]), f[active[0]]!);
+  if (active.length === 2 && f.source?.length) {
+    const other = active.find((k) => k !== 'source')!;
+    const bySource = perSource.get(other);
+    return f.source.reduce((sum, src) => sum + sumOf(bySource?.get(src), f[other]!), 0);
+  }
+  return null;
+}
+
 export type FacetValue = { value: string; lead_count: number };
+
+type FacetIndex = {
+  /** Dropdown options: per facet, values with their count summed over sources. */
+  options: Record<string, FacetValue[]>;
+  /** facet -> value -> count, for the planner and exact totals. */
+  totals: Map<string, Map<string, number>>;
+  /** facet -> source -> value -> count, for exact source+facet totals. */
+  perSource: Map<string, Map<string, Map<string, number>>>;
+};
 
 /**
  * Facets only change when `npm run db:facets` runs after an import, so hold
  * them in memory for a few minutes rather than paying a database round trip on
- * every page view. Shared with `getStats` and the query planner.
+ * every page view. Shared with `getStats`, the query planner and `countLeads`.
  */
-let facetsCache: { at: number; promise: Promise<Record<string, FacetValue[]>> } | undefined;
-export function getFacets() {
+const FACET_CACHE_MS = 5 * 60_000;
+let facetsCache: { at: number; promise: Promise<FacetIndex> } | undefined;
+function facetIndex() {
   if (facetsCache && Date.now() - facetsCache.at < FACET_CACHE_MS) return facetsCache.promise;
-  const promise = query<{ facet: string; value: string; lead_count: number }>(
-    `SELECT facet, value, SUM(lead_count) AS lead_count
-     FROM lead_facets GROUP BY facet, value ORDER BY lead_count DESC`,
+  const promise = query<{ facet: string; source: string; value: string; lead_count: number }>(
+    `SELECT facet, source, value, lead_count FROM lead_facets`,
   ).then((rows) => {
-    const out: Record<string, FacetValue[]> = { source: [], industry: [], country: [], category: [] };
+    const totals = new Map<string, Map<string, number>>();
+    const perSource = new Map<string, Map<string, Map<string, number>>>();
     for (const r of rows) {
-      (out[r.facet] ??= []).push({ value: r.value, lead_count: Number(r.lead_count) });
+      const n = Number(r.lead_count);
+      let t = totals.get(r.facet);
+      if (!t) totals.set(r.facet, (t = new Map()));
+      t.set(r.value, (t.get(r.value) ?? 0) + n);
+      let bySource = perSource.get(r.facet);
+      if (!bySource) perSource.set(r.facet, (bySource = new Map()));
+      let m = bySource.get(r.source);
+      if (!m) bySource.set(r.source, (m = new Map()));
+      m.set(r.value, (m.get(r.value) ?? 0) + n);
     }
-    return out;
+    const options: Record<string, FacetValue[]> = { source: [], industry: [], country: [], category: [] };
+    for (const [facet, m] of totals) {
+      options[facet] = [...m]
+        .map(([value, lead_count]) => ({ value, lead_count }))
+        .sort((a, b) => b.lead_count - a.lead_count);
+    }
+    return { options, totals, perSource };
   });
   facetsCache = { at: Date.now(), promise };
   // Do not pin a failure in the cache.
   promise.catch(() => { if (facetsCache?.promise === promise) facetsCache = undefined; });
   return promise;
+}
+
+export function getFacets() {
+  return facetIndex().then((i) => i.options);
 }
 
 /**

@@ -77,23 +77,35 @@ All state lives in the URL, so any filtered view is a shareable link.
 
 ## Performance notes
 
-Measured on 4.56M rows (`next start`, warm): ~1s for most filtered views, ~2-4s
-for the worst combinations. The dev server is 3-5x slower — benchmark against a
-production build, not `next dev`.
+Measured on 16M rows (`next start`, warm, local MariaDB): 50-90 ms end to end
+for facet-only views, ~1 s for the two combinations whose count cannot use an
+index (fulltext prefix search, `has=email`). The dev server renders the same
+page in 1.2-2.5 s, so benchmark against a production build, not `next dev`.
 
-Three things keep it there, all of which matter more as the table grows:
+What keeps it there, all of which matter more as the table grows:
 
-- **Header counts come from `lead_facets`, not `leads`.** A `GROUP BY source`
-  over the full table costs seconds on *every* page load. Re-run
-  `npm run db:facets` after each import or the header goes stale.
+- **Two-step page fetch.** `searchLeads` finds the page of ids through an
+  index, then fetches the wide rows by primary key. See the comments in
+  `src/lib/leads.ts` for why a single JOIN form is off the table (it filesorted
+  the whole table on MySQL 8 and filled the production temp disk).
+- **Header counts and most footer totals come from `lead_facets`, not
+  `leads`.** Any single facet filter, and `source` plus one other facet, has an
+  exact pre-computed total, so those views issue no COUNT at all. Re-run
+  `npm run db:facets` after each import or the header and totals go stale.
 - **Facet columns need standalone indexes.** `idx_industry` / `idx_country` /
   `idx_category` are composites led by `source`, so filtering on country alone
   cannot use them. `db/migrations/002_filter_indexes.sql` adds the single-column
   versions; without them those filters do a full table scan.
-- **Counts are capped and time-limited.** `COUNT_CAP` (100k) bounds rows
-  examined and `COUNT_TIMEOUT_SECONDS` (2s) bounds wall time in
-  `src/lib/leads.ts`. Predicates like "has email" are not usefully indexable, so
-  some combinations fall back to an approximate total shown as `N+`.
+- **Remaining counts are capped and time-limited.** `COUNT_CAP` (100k) bounds
+  rows examined and `COUNT_TIMEOUT_SECONDS` (1s) bounds wall time. Predicates
+  like "has email" are not usefully indexable, so those combinations fall back
+  to an approximate total shown as `N+`. A composite index on
+  `(source, contact_email)` would fix that but is a long online rebuild.
+- **Only the results segment re-renders on a filter change.** The header and
+  filter sidebar live in `src/app/(leads)/layout.tsx`; the page segment shows
+  `loading.tsx` instantly and the footer prefetches the neighbouring pages.
+- **One client boundary for the table.** Per-row client components cost ~65 ms
+  a row in dev; the table is one client component fed plain row data.
 
 ## Apollo
 

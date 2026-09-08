@@ -1,5 +1,6 @@
 'use client';
 
+import { useEffect } from 'react';
 import { useRouter, usePathname, useSearchParams } from 'next/navigation';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -21,13 +22,24 @@ export function Pagination({
   const pathname = usePathname();
   const params = useSearchParams();
 
-  const go = (patch: Record<string, string>) => {
+  const hrefFor = (patch: Record<string, string>) => {
     const next = new URLSearchParams(params.toString());
     for (const [k, v] of Object.entries(patch)) next.set(k, v);
-    router.push(`${pathname}?${next.toString()}`, { scroll: false });
+    return `${pathname}?${next.toString()}`;
   };
+  const go = (patch: Record<string, string>) => router.push(hrefFor(patch), { scroll: false });
 
   const lastPage = Math.max(Math.ceil(total / perPage), 1);
+
+  // Fetch the neighbouring pages while the user reads this one, so Next and
+  // Previous render from the router cache instead of waiting on the server.
+  // (router.prefetch keeps a dynamic page for the `static` staleTime, 5 min.)
+  const nextHref = page < lastPage ? hrefFor({ page: String(page + 1) }) : null;
+  const prevHref = page > 1 ? hrefFor({ page: String(page - 1) }) : null;
+  useEffect(() => {
+    if (nextHref) router.prefetch(nextHref);
+    if (prevHref) router.prefetch(prevHref);
+  }, [router, nextHref, prevHref]);
   const from = total === 0 ? 0 : (page - 1) * perPage + 1;
   const to = Math.min(page * perPage, total);
 
