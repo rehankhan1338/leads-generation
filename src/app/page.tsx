@@ -1,11 +1,12 @@
 import { Suspense } from 'react';
 import Link from 'next/link';
 import { Activity, Database } from 'lucide-react';
-import { countLeads, getFacets, getStats, searchLeads, type LeadFilters as Filters } from '@/lib/leads';
+import { countLeads, getFacets, getStats, searchLeads } from '@/lib/leads';
 import { parseFilters, type RawParams } from '@/lib/search-params';
 import { LeadFilters } from '@/components/leads/filters';
 import { LeadsTable } from '@/components/leads/leads-table';
 import { Pagination } from '@/components/leads/pagination';
+import { ExportButton } from '@/components/leads/export-button';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Badge } from '@/components/ui/badge';
 
@@ -17,6 +18,15 @@ export default async function LeadsPage({
   searchParams: Promise<RawParams>;
 }) {
   const sp = await searchParams;
+  // Start the expensive queries first so they overlap the (cached) facet read
+  // and the shell render instead of waiting behind them.
+  const filters = parseFilters(sp);
+  const search = searchLeads(filters);
+  const count = countLeads(filters, search.then((r) => r.rows.length));
+  // Keep an unobserved rejection from surfacing before the Suspense boundary reads it.
+  search.catch(() => {});
+  count.catch(() => {});
+
   const [facets, stats] = await Promise.all([getFacets(), getStats()]);
   const totalLeads = stats.reduce((sum, s) => sum + s.count, 0);
 
@@ -38,6 +48,9 @@ export default async function LeadsPage({
             <Link href="/progress" className="flex items-center gap-1 rounded-md border px-2 py-1 hover:text-foreground">
               <Activity className="size-3" /> Import progress
             </Link>
+            <Suspense fallback={<Skeleton className="h-8 w-32" />}>
+              <ExportButton />
+            </Suspense>
           </div>
         </div>
       </header>
@@ -51,7 +64,7 @@ export default async function LeadsPage({
 
         <main className="min-w-0 flex-1">
           <Suspense key={JSON.stringify(sp)} fallback={<TableSkeleton />}>
-            <Results sp={sp} />
+            <Results search={search} count={count} />
           </Suspense>
         </main>
       </div>
@@ -59,9 +72,11 @@ export default async function LeadsPage({
   );
 }
 
-async function Results({ sp }: { sp: RawParams }) {
-  const filters = parseFilters(sp);
-  const { rows, page, perPage } = await searchLeads(filters);
+type Search = ReturnType<typeof searchLeads>;
+type Count = ReturnType<typeof countLeads>;
+
+async function Results({ search, count }: { search: Search; count: Count }) {
+  const { rows, page, perPage } = await search;
 
   // The count can take up to COUNT_TIMEOUT_SECONDS on unindexed combinations;
   // stream it behind the rows instead of holding the whole table back.
@@ -69,18 +84,14 @@ async function Results({ sp }: { sp: RawParams }) {
     <>
       <LeadsTable rows={rows} />
       <Suspense fallback={<PaginationSkeleton />}>
-        <Footer filters={filters} rowsOnPage={rows.length} page={page} perPage={perPage} />
+        <Footer count={count} page={page} perPage={perPage} />
       </Suspense>
     </>
   );
 }
 
-async function Footer({
-  filters, rowsOnPage, page, perPage,
-}: {
-  filters: Filters; rowsOnPage: number; page: number; perPage: number;
-}) {
-  const { total, capped } = await countLeads(filters, rowsOnPage);
+async function Footer({ count, page, perPage }: { count: Count; page: number; perPage: number }) {
+  const { total, capped } = await count;
   return <Pagination page={page} perPage={perPage} total={total} capped={capped} />;
 }
 

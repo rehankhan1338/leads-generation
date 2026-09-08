@@ -34,7 +34,8 @@ export async function query<T = Record<string, unknown>>(sql: string, params: un
 }
 
 let flavorPromise: Promise<'mariadb' | 'mysql'> | undefined;
-async function flavor() {
+/** Which server we are talking to; one query per process, cached. */
+export async function flavor() {
   flavorPromise ??= pool
     .query<mysql.RowDataPacket[]>('SELECT VERSION() AS v')
     .then(([[r]]) => (/mariadb/i.test(String(r.v)) ? 'mariadb' : 'mysql'))

@@ -1,4 +1,4 @@
-import { query, withTimeout } from './db';
+import { flavor, query, withTimeout } from './db';
 
 export type Lead = {
   id: number;
@@ -306,33 +306,51 @@ export async function searchLeads(f: LeadFilters) {
   // Two steps: find the page of ids using only the index, then fetch the wide
   // rows by primary key. Sorting/skipping over 36 wide columns (20 GB table)
   // was 10-100x slower than doing the same over index entries.
-  const hint = await indexHint(f, sortCol, await estimateMatches(f));
-  const idsFor = async (forceIndex: string) =>
-    query<{ id: number }>(
-      await withTimeout(ROWS_TIMEOUT_SECONDS,
-        `SELECT id FROM leads ${forceIndex} ${fullWhere} ${orderBy} LIMIT ? OFFSET ?`),
-      [...params, perPage, offset],
-    );
-  let idRows: { id: number }[];
-  try {
-    idRows = await idsFor(hint);
-  } catch (e) {
-    // The server rejected the hint (an index we thought existed does not, or
-    // its name is unusable here). Correct-but-slower beats an error page.
-    if (!hint || (e as { errno?: number }).errno !== 1176) throw e;
-    knownIndexes = undefined;
-    idRows = await idsFor('');
-  }
-  const ids = idRows.map((r) => r.id);
+  // Everything the query plan depends on, fetched together (all cached after
+  // the first request, so this is normally free).
+  const [estimate] = await Promise.all([estimateMatches(f), existingIndexes(), flavor()]);
+  const hint = await indexHint(f, sortCol, estimate);
 
-  let rows: Lead[] = [];
-  if (ids.length) {
+  const idSelect = (forceIndex: string) =>
+    `SELECT id FROM leads ${forceIndex} ${fullWhere} ${orderBy} LIMIT ? OFFSET ?`;
+  const wideColumns = LEAD_COLUMNS.replace(/\bid\b/, 'l.id');
+
+  const run = async (forceIndex: string): Promise<Lead[]> => {
+    if (orderBy) {
+      // Single round trip: the derived table finds the page of ids through the
+      // index and the join pulls the wide rows; repeating ORDER BY on the
+      // outside keeps them in page order. Each network hop to a remote
+      // database costs more than the query itself, so one statement beats two.
+      const outerOrder = orderBy.replace(/\b(id|[a-z_]+) (ASC|DESC)/g, 'l.$1 $2');
+      return query<Lead>(
+        await withTimeout(ROWS_TIMEOUT_SECONDS,
+          `SELECT ${wideColumns} FROM (${idSelect(forceIndex)}) p JOIN leads l ON l.id = p.id ${outerOrder}`),
+        [...params, perPage, offset],
+      );
+    }
+    // Relevance order has no column to re-sort by, so keep the two-step form
+    // and restore the fulltext ranking from the id list.
+    const ids = (
+      await query<{ id: number }>(await withTimeout(ROWS_TIMEOUT_SECONDS, idSelect(forceIndex)), [...params, perPage, offset])
+    ).map((r) => r.id);
+    if (!ids.length) return [];
     const fetched = await query<Lead>(
       `SELECT ${LEAD_COLUMNS} FROM leads WHERE id IN (${ids.map(() => '?').join(',')})`,
       ids,
     );
     const byId = new Map(fetched.map((r) => [r.id, r]));
-    rows = ids.map((id) => byId.get(id)).filter((r): r is Lead => r != null);
+    return ids.map((id) => byId.get(id)).filter((r): r is Lead => r != null);
+  };
+
+  let rows: Lead[];
+  try {
+    rows = await run(hint);
+  } catch (e) {
+    // The server rejected the hint (an index we thought existed does not, or
+    // its name is unusable here). Correct-but-slower beats an error page.
+    if (!hint || (e as { errno?: number }).errno !== 1176) throw e;
+    knownIndexes = undefined;
+    rows = await run('');
   }
 
   return { rows, page, perPage };
@@ -346,7 +364,7 @@ export async function searchLeads(f: LeadFilters) {
  * is kept apart from `searchLeads` so the page can stream the rows immediately
  * and fill the total in when it arrives.
  */
-export async function countLeads(f: LeadFilters, rowsOnPage: number) {
+export async function countLeads(f: LeadFilters, rowsOnPage: number | Promise<number>) {
   const { fullWhere, params } = buildQueryShape(f);
   const { perPage, offset } = pageBounds(f);
   try {
@@ -359,22 +377,35 @@ export async function countLeads(f: LeadFilters, rowsOnPage: number) {
     return { total, capped: total >= COUNT_CAP };
   } catch {
     // Timed out: we know there is at least this page, so keep paging usable.
-    return { total: offset + rowsOnPage + (rowsOnPage === perPage ? perPage : 0), capped: true };
+    const n = await rowsOnPage;
+    return { total: offset + n + (n === perPage ? perPage : 0), capped: true };
   }
 }
 
 export type FacetValue = { value: string; lead_count: number };
 
-export async function getFacets() {
-  const rows = await query<{ facet: string; value: string; lead_count: number }>(
+/**
+ * Facets only change when `npm run db:facets` runs after an import, so hold
+ * them in memory for a few minutes rather than paying a database round trip on
+ * every page view. Shared with `getStats` and the query planner.
+ */
+let facetsCache: { at: number; promise: Promise<Record<string, FacetValue[]>> } | undefined;
+export function getFacets() {
+  if (facetsCache && Date.now() - facetsCache.at < FACET_CACHE_MS) return facetsCache.promise;
+  const promise = query<{ facet: string; value: string; lead_count: number }>(
     `SELECT facet, value, SUM(lead_count) AS lead_count
      FROM lead_facets GROUP BY facet, value ORDER BY lead_count DESC`,
-  );
-  const out: Record<string, FacetValue[]> = { source: [], industry: [], country: [], category: [] };
-  for (const r of rows) {
-    (out[r.facet] ??= []).push({ value: r.value, lead_count: Number(r.lead_count) });
-  }
-  return out;
+  ).then((rows) => {
+    const out: Record<string, FacetValue[]> = { source: [], industry: [], country: [], category: [] };
+    for (const r of rows) {
+      (out[r.facet] ??= []).push({ value: r.value, lead_count: Number(r.lead_count) });
+    }
+    return out;
+  });
+  facetsCache = { at: Date.now(), promise };
+  // Do not pin a failure in the cache.
+  promise.catch(() => { if (facetsCache?.promise === promise) facetsCache = undefined; });
+  return promise;
 }
 
 /**
@@ -383,8 +414,8 @@ export async function getFacets() {
  * Run `npm run db:facets` after an import to keep these current.
  */
 export async function getStats() {
-  const rows = await query<{ value: string; lead_count: number }>(
-    `SELECT value, lead_count FROM lead_facets WHERE facet = 'source' ORDER BY lead_count DESC`,
-  );
-  return rows.map((r) => ({ source: r.value, count: Number(r.lead_count) }));
+  const facets = await getFacets();
+  return (facets.source ?? [])
+    .map((r) => ({ source: r.value, count: r.lead_count }))
+    .sort((a, b) => b.count - a.count);
 }
