@@ -328,33 +328,25 @@ export async function searchLeads(f: LeadFilters) {
     return searchLeads({ ...f, sort: undefined, dir: undefined });
   }
 
-  const idSelect = (forceIndex: string) =>
-    `SELECT id FROM leads ${forceIndex} ${fullWhere} ${orderBy} LIMIT ? OFFSET ?`;
-  const wideColumns = LEAD_COLUMNS.replace(/\bid\b/, 'l.id');
-
+  // Two statements on purpose. A single "derived table JOIN leads ORDER BY"
+  // form was tried to save a round trip; MariaDB planned it well but MySQL 8
+  // on production drove the join from the 16M-row side and filesorted the
+  // whole table through temp disk until the volume was full. The id list is
+  // tiny, so a second `WHERE id IN (...)` fetch is cheap and plan-proof.
   const run = async (forceIndex: string): Promise<Lead[]> => {
-    if (orderBy) {
-      // Single round trip: the derived table finds the page of ids through the
-      // index and the join pulls the wide rows; repeating ORDER BY on the
-      // outside keeps them in page order. Each network hop to a remote
-      // database costs more than the query itself, so one statement beats two.
-      const outerOrder = orderBy.replace(/\b(id|[a-z_]+) (ASC|DESC)/g, 'l.$1 $2');
-      return query<Lead>(
-        await withTimeout(ROWS_TIMEOUT_SECONDS,
-          `SELECT ${wideColumns} FROM (${idSelect(forceIndex)}) p JOIN leads l ON l.id = p.id ${outerOrder}`),
-        [...params, perPage, offset],
-      );
-    }
-    // Relevance order has no column to re-sort by, so keep the two-step form
-    // and restore the fulltext ranking from the id list.
     const ids = (
-      await query<{ id: number }>(await withTimeout(ROWS_TIMEOUT_SECONDS, idSelect(forceIndex)), [...params, perPage, offset])
+      await query<{ id: number }>(
+        await withTimeout(ROWS_TIMEOUT_SECONDS,
+          `SELECT id FROM leads ${forceIndex} ${fullWhere} ${orderBy} LIMIT ? OFFSET ?`),
+        [...params, perPage, offset],
+      )
     ).map((r) => r.id);
     if (!ids.length) return [];
     const fetched = await query<Lead>(
       `SELECT ${LEAD_COLUMNS} FROM leads WHERE id IN (${ids.map(() => '?').join(',')})`,
       ids,
     );
+    // Restore page order (and fulltext relevance order) from the id list.
     const byId = new Map(fetched.map((r) => [r.id, r]));
     return ids.map((id) => byId.get(id)).filter((r): r is Lead => r != null);
   };
