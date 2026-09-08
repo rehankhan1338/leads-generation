@@ -27,12 +27,17 @@ export default async function LeadsPage({
   // Suspense reads this later; do not let an early failure go unobserved.
   count.catch(() => {});
 
-  const { rows, page, perPage } = await search;
+  const { rows, page, perPage, sortIgnored } = await search;
 
   // The count can take up to COUNT_TIMEOUT_SECONDS on unindexed combinations;
   // stream it behind the rows instead of holding the whole table back.
   return (
     <>
+      {sortIgnored && (
+        <p className="border-b bg-amber-500/10 px-4 py-2 text-xs text-amber-700 dark:text-amber-400" role="status">
+          Sorting by {filters.sort} is too slow for this combination of filters, so the results are shown newest first.
+        </p>
+      )}
       <LeadsTable rows={rows} />
       <Suspense fallback={<PaginationSkeleton />}>
         <Footer count={count} page={page} perPage={perPage} />

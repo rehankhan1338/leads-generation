@@ -36,6 +36,10 @@ const INDEXES = [
   { name: 'idx_country_employees',        ddl: 'ADD KEY idx_country_employees (country, employees)' },
   { name: 'idx_source_employees',         ddl: 'ADD KEY idx_source_employees (source, employees)' },
   { name: 'idx_source_country_employees', ddl: 'ADD KEY idx_source_country_employees (source, country, employees)' },
+  // db/migrations/006 — two facets without a source filter.
+  { name: 'idx_country_industry',  ddl: 'ADD KEY idx_country_industry (country, industry)' },
+  { name: 'idx_country_category',  ddl: 'ADD KEY idx_country_category (country, category)' },
+  { name: 'idx_industry_category', ddl: 'ADD KEY idx_industry_category (industry, category)' },
 ];
 
 const db = await connect();

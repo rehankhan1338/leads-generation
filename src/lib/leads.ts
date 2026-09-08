@@ -100,30 +100,57 @@ export const COUNT_CAP = 100_000;
  * long the browser keeps "loading" after the rows are already on screen.
  */
 export const COUNT_TIMEOUT_SECONDS = 1;
-/** Hard ceiling on the page query itself; beyond this the request errors rather than hangs. */
-export const ROWS_TIMEOUT_SECONDS = 30;
+/**
+ * How long the planned page query may run before we try a cheaper shape (see
+ * `searchLeads`). A facet combined with a sort on a column the facet's rows
+ * rarely populate can walk the whole sort index; measured at 14-20 s.
+ */
+export const ROWS_TIMEOUT_SECONDS = 3;
+/** Ceiling on the fallback (default order) query; beyond this the request errors rather than hangs. */
+export const FALLBACK_TIMEOUT_SECONDS = 15;
+
+/** MariaDB `max_statement_time` (1969) and MySQL 8 `MAX_EXECUTION_TIME` (3024) both abort the statement. */
+const isTimeout = (e: unknown) => {
+  const errno = (e as { errno?: number }).errno;
+  return errno === 1969 || errno === 3024;
+};
+
+/**
+ * Text search shape. Words of three or more letters use the fulltext index;
+ * anything shorter is a prefix match on the company name, which has a
+ * B-tree index (fulltext needs whole tokens).
+ */
+function searchMode(q?: string): 'fulltext' | 'prefix' | null {
+  const t = q?.trim();
+  if (!t) return null;
+  const tokens = t.split(/\s+/).filter((w) => w.replace(/[^\p{L}\p{N}]/gu, '').length >= 3);
+  return tokens.length ? 'fulltext' : 'prefix';
+}
 
 function buildWhere(f: LeadFilters) {
   const where: string[] = [];
   const params: unknown[] = [];
 
   const q = f.q?.trim();
-  if (q) {
-    // Fulltext (indexed, prefix-matched) for real words; LIKE for very short terms.
+  const mode = searchMode(q);
+  if (q && mode === 'fulltext') {
     const tokens = q.split(/\s+/).filter((t) => t.replace(/[^\p{L}\p{N}]/gu, '').length >= 3);
-    if (tokens.length) {
-      const expr = tokens
-        .map((t) => `+${t.replace(/[+\-><()~*"@]/g, ' ').trim()}*`)
-        .filter((t) => t.length > 2)
-        .join(' ');
-      if (expr) {
-        where.push('MATCH (company_name, domain, industry, contact_name) AGAINST (? IN BOOLEAN MODE)');
-        params.push(expr);
-      }
-    } else {
-      where.push('(company_name LIKE ? OR domain LIKE ?)');
-      params.push(`${q}%`, `${q}%`);
+    const expr = tokens
+      .map((t) => `+${t.replace(/[+\-><()~*"@]/g, ' ').trim()}*`)
+      .filter((t) => t.length > 2)
+      .join(' ');
+    if (expr) {
+      where.push('MATCH (company_name, domain, industry, contact_name) AGAINST (? IN BOOLEAN MODE)');
+      params.push(expr);
     }
+  } else if (q && mode === 'prefix') {
+    // While the user is still typing ("ab") the old `company LIKE 'ab%' OR
+    // domain LIKE 'ab%'` made the optimizer sort-union two ~100k-entry index
+    // ranges and filesort them (11 s per keystroke). A single prefix range on
+    // idx_company, read in name order, is instant. Domains become searchable
+    // once the third character arrives and the fulltext path takes over.
+    where.push('company_name LIKE ?');
+    params.push(`${q}%`);
   }
 
   const inList = (col: string, vals?: string[]) => {
@@ -181,6 +208,27 @@ const FILTER_INDEXES: Record<string, string[]> = {
   emailStatus: ['idx_email_status'],
 };
 
+/**
+ * Composite indexes over facet pairs (db/migrations/006). Keyed by the two
+ * facet names in FACET_KEYS order.
+ */
+const PAIR_INDEXES: Record<string, string> = {
+  'industry|country': 'idx_country_industry',
+  'country|category': 'idx_country_category',
+  'industry|category': 'idx_industry_category',
+};
+
+/** The composite covering two of the active facets, if the database has one. */
+function pairIndex(facets: FacetKey[], known: Set<string>) {
+  for (let i = 0; i < facets.length; i++) {
+    for (let j = i + 1; j < facets.length; j++) {
+      const idx = PAIR_INDEXES[`${facets[i]}|${facets[j]}`];
+      if (idx && known.has(idx)) return idx;
+    }
+  }
+  return null;
+}
+
 const SORT_INDEXES: Record<string, string> = {
   revenue_usd: 'idx_revenue',
   funding_usd: 'idx_funding',
@@ -213,19 +261,83 @@ const SMALL_RESULT_SET = 100_000;
 
 const FACET_KEYS = ['source', 'industry', 'country', 'category'] as const;
 
-/** Upper bound on matching rows from the facet filters alone, or null if none apply. */
-async function estimateMatches(f: LeadFilters) {
+type FacetKey = (typeof FACET_KEYS)[number];
+
+/**
+ * Rows matching each active facet filter on its own, from the facet table.
+ * The smallest is the upper bound on the result set and names the index worth
+ * seeking on.
+ */
+async function facetEstimates(f: LeadFilters) {
   const active = FACET_KEYS.filter((k) => f[k]?.length);
-  if (!active.length) return null;
+  const out = new Map<FacetKey, number>();
+  if (!active.length) return out;
   const { totals } = await facetIndex();
-  let est = Infinity;
   for (const facet of active) {
     const m = totals.get(facet);
     if (!m) continue;
-    est = Math.min(est, f[facet]!.reduce((sum, v) => sum + (m.get(v) ?? 0), 0));
+    out.set(facet, f[facet]!.reduce((sum, v) => sum + (m.get(v) ?? 0), 0));
   }
+  return out;
+}
+
+/**
+ * Facet values mostly belong to one source: every industry like "Home &
+ * Garden" and every platform is StoreLeads-only, Apollo has its own industry
+ * list. `lead_facets` records which sources carry each value, so the filter
+ * can be narrowed to those sources without changing what it matches. That
+ * turns "country + platform" (no covering index, 13 s) into a lookup on the
+ * existing (source, country) / (source, category) composites, and gives every
+ * facet + sort pair a selective seek index. Between an import and the next
+ * `npm run db:facets` a brand-new source's rows are invisible to this — the
+ * same lag the header counts already have.
+ */
+async function narrowToSources(f: LeadFilters): Promise<{ filters: LeadFilters; empty: boolean }> {
+  const active = FACET_KEYS.filter((k) => k !== 'source' && f[k]?.length);
+  if (!active.length) return { filters: f, empty: false };
+  const { totals, perSource } = await facetIndex();
+  const allSources = [...(totals.get('source')?.keys() ?? [])];
+  if (!allSources.length) return { filters: f, empty: false };
+
+  let allowed = new Set(f.source?.length ? f.source : allSources);
+  for (const facet of active) {
+    const bySource = perSource.get(facet);
+    if (!bySource) continue;
+    const having = new Set<string>();
+    for (const [src, m] of bySource) {
+      if (f[facet]!.some((v) => m.has(v))) having.add(src);
+    }
+    allowed = new Set([...allowed].filter((s) => having.has(s)));
+  }
+  if (allowed.size === 0) return { filters: f, empty: true };
+  if (!f.source?.length && allowed.size === allSources.length) return { filters: f, empty: false };
+  if (f.source?.length && allowed.size === f.source.length) return { filters: f, empty: false };
+  return { filters: { ...f, source: [...allowed] }, empty: false };
+}
+
+/** Upper bound on matching rows from the facet filters alone, or null if none apply. */
+function smallestEstimate(estimates: Map<FacetKey, number>) {
+  let est = Infinity;
+  for (const n of estimates.values()) est = Math.min(est, n);
   return est === Infinity ? null : est;
 }
+
+/** The active range filter whose column we can sort by, if any (first wins). */
+function activeRange(f: LeadFilters) {
+  for (const [min, max, idx] of RANGE_INDEXES) {
+    if (f[min] != null || (max && f[max] != null)) return { idx, col: RANGE_COLUMNS[idx] };
+  }
+  return null;
+}
+
+const RANGE_COLUMNS: Record<string, string> = {
+  idx_revenue: 'revenue_usd',
+  idx_funding: 'funding_usd',
+  idx_employees: 'employees',
+  idx_monthly_visits: 'monthly_visits',
+  idx_tech_count: 'tech_count',
+  idx_growth: 'growth_percent',
+};
 
 /**
  * Index names present on the connected database. Not every environment has run
@@ -238,9 +350,30 @@ function existingIndexes() {
     `SELECT DISTINCT INDEX_NAME AS index_name FROM information_schema.statistics
      WHERE table_schema = DATABASE() AND table_name = 'leads'`,
   )
-    .then((rows) => new Set(rows.map((r) => r.index_name)))
+    .then((rows) => {
+      const known = new Set(rows.map((r) => r.index_name));
+      const missing = missingIndexes(known);
+      if (known.size && missing.length) {
+        warnOnce('missing-indexes', `[leads] this database lacks ${missing.length} of the indexes the filters rely on (${missing.join(', ')}). Filtered pages fall back to slow plans until \`node scripts/add-indexes.mjs\` is run against it.`);
+      }
+      return known;
+    })
     .catch(() => { knownIndexes = undefined; return new Set<string>(); });
   return knownIndexes;
+}
+
+/** Every index the planner knows how to use, so a deployment can be checked against it. */
+export function plannerIndexes() {
+  const all = new Set<string>();
+  Object.values(FILTER_INDEXES).flat().forEach((i) => all.add(i));
+  Object.values(PAIR_INDEXES).forEach((i) => all.add(i));
+  Object.values(SORT_INDEXES).forEach((i) => all.add(i));
+  RANGE_INDEXES.forEach(([, , i]) => all.add(i));
+  return [...all].sort();
+}
+
+export function missingIndexes(known: Set<string>) {
+  return plannerIndexes().filter((i) => !known.has(i));
 }
 
 const warned = new Set<string>();
@@ -250,19 +383,48 @@ function warnOnce(key: string, message: string) {
   console.warn(message);
 }
 
-async function indexHint(f: LeadFilters, sortCol: string, estimate: number | null) {
+async function indexHint(f: LeadFilters, sortCol: string, estimates: Map<FacetKey, number>) {
   const hints = new Set<string>();
-  for (const [key, idx] of Object.entries(FILTER_INDEXES)) {
-    if ((f[key as keyof LeadFilters] as string[] | undefined)?.length) idx.forEach((i) => hints.add(i));
+
+  // A range filter sorted by its own column is one index range read in order
+  // (0-120 ms measured, with or without a facet on top); anything else the
+  // optimizer might pick for it means a filesort or a row-by-row walk.
+  const range = activeRange(f);
+  if (range && range.col === sortCol) {
+    const known = await existingIndexes();
+    return known.has(range.idx) ? `FORCE INDEX (${range.idx})` : '';
   }
-  for (const [min, max, idx] of RANGE_INDEXES) {
-    if (f[min] != null || (max && f[max] != null)) hints.add(idx);
+
+  const known = await existingIndexes();
+  const facets = [...estimates.keys()];
+  if (f.source?.length) {
+    // Source's composites (source, country/industry/category) cover source +
+    // one other facet exactly, so they always go in when source is filtered.
+    FILTER_INDEXES.source.forEach((i) => hints.add(i));
+  } else if (facets.length >= 2) {
+    // Two facets and no source: only a composite over the pair is safe. Any
+    // single-column index walks one facet's rows in id order testing the other
+    // column row by row, and how soon it finds 50 matches depends entirely on
+    // where the data sits (Sweden + Home & Garden: 11 s via the country index,
+    // 0.3 s via the industry index; Sweden + WooCommerce the other way round).
+    // Without the composite, leave the optimizer unhinted: it index-merges the
+    // two single-column indexes, which is index-only and bounded by the
+    // smaller list (0.2-0.6 s measured) instead of by luck.
+    const pair = pairIndex(facets, known);
+    if (pair) hints.add(pair);
+    else return '';
+  } else if (facets.length === 1) {
+    FILTER_INDEXES[facets[0]]?.forEach((i) => hints.add(i));
+  } else if (f.emailStatus?.length) {
+    FILTER_INDEXES.emailStatus.forEach((i) => hints.add(i));
   }
+  if (range) hints.add(range.idx);
+
   // Nothing selective to seek on: scanning in sort order is the right plan.
   if (hints.size === 0) return '';
+  const estimate = smallestEstimate(estimates);
   const sortIdx = SORT_INDEXES[sortCol];
   if (sortIdx && (estimate == null || estimate > SMALL_RESULT_SET)) hints.add(sortIdx);
-  const known = await existingIndexes();
   const usable = [...hints].filter((i) => known.has(i));
   return usable.length ? `FORCE INDEX (${usable.join(', ')})` : '';
 }
@@ -280,9 +442,24 @@ function buildQueryShape(f: LeadFilters) {
   // A text search with no explicit sort comes back in relevance order. Forcing
   // `ORDER BY id` on a fulltext match makes InnoDB materialise every hit first
   // (a common prefix like "shop*" matches millions) and ran for minutes.
-  const relevance = Boolean(f.q?.trim()) && !f.sort;
-  const sortCol = SORTABLE[f.sort ?? ''] ?? 'id';
-  const dir = f.dir === 'asc' ? 'ASC' : 'DESC';
+  const mode = searchMode(f.q);
+  const relevance = mode === 'fulltext' && !f.sort;
+  let sortCol = SORTABLE[f.sort ?? ''] ?? 'id';
+  let dir = f.dir === 'asc' ? 'ASC' : 'DESC';
+  if (!f.sort) {
+    const range = activeRange(f);
+    if (mode === 'prefix') {
+      // Prefix matches come straight off idx_company in name order; "newest
+      // first" would filesort every match (100k+ for two letters).
+      sortCol = 'company_name';
+      dir = 'ASC';
+    } else if (range) {
+      // "Revenue over $1M" newest-first filesorted 1.6M index entries (0.4-1 s);
+      // biggest-first is the index's own order and is what the filter implies.
+      sortCol = range.col;
+      dir = 'DESC';
+    }
+  }
   // Keep ORDER BY a plain indexed column: an expression like
   // `(col IS NULL) ASC, col DESC` forces a filesort over every matching row,
   // which at millions of rows per source ran for minutes. MariaDB already
@@ -297,18 +474,29 @@ function buildQueryShape(f: LeadFilters) {
   return { fullWhere, params, orderBy, sortCol };
 }
 
+export type LeadPage = {
+  rows: Lead[];
+  page: number;
+  perPage: number;
+  /** The requested sort was dropped because no index could serve it in time. */
+  sortIgnored: boolean;
+};
+
 /** One page of leads. The total is deliberately separate — see `countLeads`. */
-export async function searchLeads(f: LeadFilters) {
+export async function searchLeads(input: LeadFilters): Promise<LeadPage> {
+  const { perPage, page, offset } = pageBounds(input);
+  const { filters: f, empty } = await narrowToSources(input);
+  // The selected values live in sources that share no rows: nothing can match.
+  if (empty) return { rows: [], page, perPage, sortIgnored: false };
   const { fullWhere, params, orderBy, sortCol } = buildQueryShape(f);
-  const { perPage, page, offset } = pageBounds(f);
 
   // Two steps: find the page of ids using only the index, then fetch the wide
   // rows by primary key. Sorting/skipping over 36 wide columns (20 GB table)
   // was 10-100x slower than doing the same over index entries.
   // Everything the query plan depends on, fetched together (all cached after
   // the first request, so this is normally free).
-  const [estimate, known] = await Promise.all([estimateMatches(f), existingIndexes(), flavor()]);
-  const hint = await indexHint(f, sortCol, estimate);
+  const [estimates, known] = await Promise.all([facetEstimates(f), existingIndexes(), flavor()]);
+  const hint = await indexHint(f, sortCol, estimates);
 
   // Sorting a 16M-row table on a column with no index means a filesort of the
   // whole table through the server's temp directory; on a managed database
@@ -325,10 +513,10 @@ export async function searchLeads(f: LeadFilters) {
   // on production drove the join from the 16M-row side and filesorted the
   // whole table through temp disk until the volume was full. The id list is
   // tiny, so a second `WHERE id IN (...)` fetch is cheap and plan-proof.
-  const run = async (forceIndex: string): Promise<Lead[]> => {
+  const run = async (forceIndex: string, seconds: number): Promise<Lead[]> => {
     const ids = (
       await query<{ id: number }>(
-        await withTimeout(ROWS_TIMEOUT_SECONDS,
+        await withTimeout(seconds,
           `SELECT id FROM leads ${forceIndex} ${fullWhere} ${orderBy} LIMIT ? OFFSET ?`),
         [...params, perPage, offset],
       )
@@ -343,18 +531,55 @@ export async function searchLeads(f: LeadFilters) {
     return ids.map((id) => byId.get(id)).filter((r): r is Lead => r != null);
   };
 
-  let rows: Lead[];
-  try {
-    rows = await run(hint);
-  } catch (e) {
-    // The server rejected the hint (an index we thought existed does not, or
-    // its name is unusable here). Correct-but-slower beats an error page.
-    if (!hint || (e as { errno?: number }).errno !== 1176) throw e;
-    knownIndexes = undefined;
-    rows = await run('');
+  // A sort we already saw time out for these filters is not retried; go
+  // straight to the default order so the second click is instant.
+  const sortKey = f.sort ? slowSortKey(f, sortCol) : null;
+  if (sortKey && slowSorts.has(sortKey)) {
+    const fallback = await searchLeads({ ...f, sort: undefined, dir: undefined });
+    return { ...fallback, sortIgnored: true };
   }
 
-  return { rows, page, perPage };
+  let rows: Lead[];
+  try {
+    // Only a sorted page has a cheaper shape to fall back to, so only it gets
+    // the short budget; everything else may run to the hard ceiling.
+    rows = await run(hint, f.sort ? ROWS_TIMEOUT_SECONDS : FALLBACK_TIMEOUT_SECONDS);
+  } catch (e) {
+    if (hint && (e as { errno?: number }).errno === 1176) {
+      // The server rejected the hint (an index we thought existed does not, or
+      // its name is unusable here). Correct-but-slower beats an error page.
+      knownIndexes = undefined;
+      rows = await run('', FALLBACK_TIMEOUT_SECONDS);
+    } else if (isTimeout(e) && sortKey) {
+      // No index serves this facet + sort pair (e.g. an industry whose rows sit
+      // at the far end of the revenue index): the walk was going to take 15 s
+      // or more. The same filter in default order is a plain index seek, so
+      // show that and tell the user the sort was dropped.
+      slowSorts.add(sortKey);
+      warnOnce(`slow-sort:${sortKey}`, `[leads] sort by ${sortCol} timed out after ${ROWS_TIMEOUT_SECONDS}s for filters ${sortKey}; serving default order for this combination from now on.`);
+      const fallback = await searchLeads({ ...f, sort: undefined, dir: undefined });
+      return { ...fallback, sortIgnored: true };
+    } else {
+      throw e;
+    }
+  }
+
+  return { rows, page, perPage, sortIgnored: false };
+}
+
+/** Filter + sort combinations that timed out in this process (see `searchLeads`). */
+const slowSorts = new Set<string>();
+function slowSortKey(f: LeadFilters, sortCol: string) {
+  const parts = [`sort=${sortCol}:${f.dir ?? 'desc'}`];
+  for (const k of [...FACET_KEYS, 'emailStatus', 'has'] as const) {
+    if (f[k]?.length) parts.push(`${k}=${[...f[k]!].sort().join(',')}`);
+  }
+  if (f.q?.trim()) parts.push('q');
+  for (const [min, max] of RANGE_INDEXES) {
+    if (f[min] != null) parts.push(`${min}=${f[min]}`);
+    if (max && f[max] != null) parts.push(`${max}=${f[max]}`);
+  }
+  return parts.join('&');
 }
 
 /**
@@ -366,6 +591,11 @@ export async function searchLeads(f: LeadFilters) {
  * and fill the total in when it arrives.
  */
 export async function countLeads(f: LeadFilters, rowsOnPage: number | Promise<number>) {
+  // Only the "nothing can match" part of the source narrowing helps here; the
+  // narrowed predicate itself would make a two-facet count walk rows, where
+  // the unhinted count index-merges the two single-column indexes (0.2 s).
+  const { empty } = await narrowToSources(f);
+  if (empty) return { total: 0, capped: false };
   // Facet-only filters have a pre-computed exact total; skip the database.
   const exact = await exactTotalFromFacets(f);
   if (exact != null) return { total: exact, capped: false };

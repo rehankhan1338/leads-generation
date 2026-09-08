@@ -1,6 +1,7 @@
 import Link from 'next/link';
 import mysql from 'mysql2/promise';
 import { ArrowLeft, CheckCircle2, XCircle } from 'lucide-react';
+import { missingIndexes, plannerIndexes } from '@/lib/leads';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import {
@@ -78,6 +79,21 @@ async function runChecks(): Promise<{ checks: Check[]; ms: number }> {
       detail: missing.length
         ? `Missing: ${missing.join(', ')}. Run db/schema.sql against this database.`
         : REQUIRED_TABLES.map((t) => `${t}: ~${present.get(t)!.toLocaleString()} rows`).join('\n'),
+    });
+
+    // Filtering speed depends on these more than on anything in the code: a
+    // country or industry filter without its index walks the whole table.
+    const [idx] = await conn.query<mysql.RowDataPacket[]>(
+      `SELECT DISTINCT INDEX_NAME AS name FROM information_schema.statistics
+       WHERE table_schema = DATABASE() AND table_name = 'leads'`);
+    const known = new Set(idx.map((r) => String(r.name)));
+    const missingIdx = missingIndexes(known);
+    checks.push({
+      name: 'Filter indexes',
+      ok: missingIdx.length === 0,
+      detail: missingIdx.length
+        ? `Missing ${missingIdx.length} of ${plannerIndexes().length}: ${missingIdx.join(', ')}.\nRun \`node scripts/add-indexes.mjs\` against this database (see db/migrations/).`
+        : `All ${plannerIndexes().length} indexes the query planner uses are present.`,
     });
   } catch (e) {
     checks.push({ name: 'Required tables', ok: false, detail: (e as Error).message });
