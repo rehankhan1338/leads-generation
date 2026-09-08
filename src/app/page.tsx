@@ -22,8 +22,12 @@ export default async function LeadsPage({
   // and the shell render instead of waiting behind them.
   const filters = parseFilters(sp);
   const search = searchLeads(filters);
-  const count = countLeads(filters, search.then((r) => r.rows.length));
-  // Keep an unobserved rejection from surfacing before the Suspense boundary reads it.
+  // The count only needs the row total for its timeout fallback; hand it a
+  // promise that can never reject, otherwise a failed row query surfaced as an
+  // unhandled rejection (which kills the serverless function) instead of
+  // rendering the error page.
+  const count = countLeads(filters, search.then((r) => r.rows.length, () => 0));
+  // Suspense reads these later; do not let an early failure go unobserved.
   search.catch(() => {});
   count.catch(() => {});
 

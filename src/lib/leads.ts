@@ -251,6 +251,13 @@ function existingIndexes() {
   return knownIndexes;
 }
 
+const warned = new Set<string>();
+function warnOnce(key: string, message: string) {
+  if (warned.has(key)) return;
+  warned.add(key);
+  console.warn(message);
+}
+
 async function indexHint(f: LeadFilters, sortCol: string, estimate: number | null) {
   const hints = new Set<string>();
   for (const [key, idx] of Object.entries(FILTER_INDEXES)) {
@@ -308,8 +315,18 @@ export async function searchLeads(f: LeadFilters) {
   // was 10-100x slower than doing the same over index entries.
   // Everything the query plan depends on, fetched together (all cached after
   // the first request, so this is normally free).
-  const [estimate] = await Promise.all([estimateMatches(f), existingIndexes(), flavor()]);
+  const [estimate, known] = await Promise.all([estimateMatches(f), existingIndexes(), flavor()]);
   const hint = await indexHint(f, sortCol, estimate);
+
+  // Sorting a 16M-row table on a column with no index means a filesort of the
+  // whole table through the server's temp directory; on a managed database
+  // that filled the disk and took the instance down. Refuse to sort that way
+  // and fall back to newest-first until the index exists.
+  const sortIdx = SORT_INDEXES[sortCol];
+  if (sortIdx && known.size && !known.has(sortIdx)) {
+    warnOnce(sortIdx, `[leads] sort by ${sortCol} ignored: index ${sortIdx} is missing on this database. Run scripts/add-indexes.mjs.`);
+    return searchLeads({ ...f, sort: undefined, dir: undefined });
+  }
 
   const idSelect = (forceIndex: string) =>
     `SELECT id FROM leads ${forceIndex} ${fullWhere} ${orderBy} LIMIT ? OFFSET ?`;
