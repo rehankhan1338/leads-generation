@@ -74,14 +74,11 @@ const LeadRow = memo(function LeadRow({ lead, onView }: { lead: Lead; onView: (l
   return (
     <TableRow className="group">
       <TableCell>
-        <div className="flex items-center gap-2.5">
-          <Avatar lead={lead} />
-          <div className="min-w-0">
-            <div className="truncate font-medium">{lead.company_name ?? '—'}</div>
-            {lead.domain && (
-              <div className="truncate text-xs text-muted-foreground">{lead.domain}</div>
-            )}
-          </div>
+        <div className="min-w-0">
+          <div className="truncate font-medium">{lead.company_name ?? '—'}</div>
+          {lead.domain && (
+            <div className="truncate text-xs text-muted-foreground">{lead.domain}</div>
+          )}
         </div>
       </TableCell>
       <TableCell className="text-muted-foreground">
@@ -177,21 +174,6 @@ function Growth({ value }: { value: string | number | null }) {
       {n > 0 ? '+' : ''}
       {n % 1 === 0 ? n : n.toFixed(1)}%
     </span>
-  );
-}
-
-function Avatar({ lead }: { lead: Lead }) {
-  const initial = (lead.company_name ?? '?').trim().charAt(0).toUpperCase();
-  return (
-    <div className="flex size-7 shrink-0 items-center justify-center overflow-hidden rounded-md border bg-muted text-[11px] font-medium text-muted-foreground">
-      {lead.logo_url ? (
-        // Remote logos come from many hosts, so plain <img> avoids next/image config churn.
-        // eslint-disable-next-line @next/next/no-img-element
-        <img src={lead.logo_url} alt="" className="size-full object-contain" loading="lazy" decoding="async" />
-      ) : (
-        initial
-      )}
-    </div>
   );
 }
 
